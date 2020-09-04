@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/pingcap/dumpling/v4/log"
+	"github.com/eopenio/idump/v4/log"
 	"go.uber.org/zap"
 )
 

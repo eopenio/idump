@@ -8,7 +8,7 @@ import (
 	"text/template"
 
 	"github.com/go-sql-driver/mysql"
-	"github.com/pingcap/dumpling/v4/log"
+	"github.com/eopenio/idump/v4/log"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb-tools/pkg/utils"
 )

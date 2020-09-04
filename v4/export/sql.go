@@ -11,7 +11,7 @@ import (
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 
-	"github.com/pingcap/dumpling/v4/log"
+	"github.com/eopenio/idump/v4/log"
 )
 
 func ShowDatabases(db *sql.Conn) ([]string, error) {

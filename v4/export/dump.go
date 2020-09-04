@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pingcap/dumpling/v4/log"
+	"github.com/eopenio/idump/v4/log"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/pingcap/failpoint"

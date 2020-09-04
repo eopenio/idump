@@ -1,4 +1,4 @@
-module github.com/pingcap/dumpling
+module github.com/eopenio/idump
 
 go 1.13
 
