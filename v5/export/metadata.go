@@ -4,17 +4,24 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
-	"path"
 	"strings"
 	"time"
+
+	tcontext "github.com/eopenio/idump/v5/context"
+
+	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/br/pkg/storage"
+	"go.uber.org/zap"
 )
 
 type globalMetadata struct {
-	buffer bytes.Buffer
+	tctx            *tcontext.Context
+	buffer          bytes.Buffer
+	afterConnBuffer bytes.Buffer
+	snapshot        string
 
-	filePath string
+	storage storage.ExternalStorage
 }
 
 const (
@@ -24,14 +31,14 @@ const (
 	fileFieldIndex    = 0
 	posFieldIndex     = 1
 	gtidSetFieldIndex = 4
-
-	mariadbShowMasterStatusFieldNum = 4
 )
 
-func newGlobalMetadata(outputDir string) *globalMetadata {
+func newGlobalMetadata(tctx *tcontext.Context, s storage.ExternalStorage, snapshot string) *globalMetadata {
 	return &globalMetadata{
-		filePath: path.Join(outputDir, metadataPath),
+		tctx:     tctx,
+		storage:  s,
 		buffer:   bytes.Buffer{},
+		snapshot: snapshot,
 	}
 }
 
@@ -44,18 +51,30 @@ func (m *globalMetadata) recordStartTime(t time.Time) {
 }
 
 func (m *globalMetadata) recordFinishTime(t time.Time) {
+	m.buffer.Write(m.afterConnBuffer.Bytes())
 	m.buffer.WriteString("Finished dump at: " + t.Format(metadataTimeLayout) + "\n")
 }
 
-func (m *globalMetadata) recordGlobalMetaData(db *sql.Conn, serverType ServerType, afterConn bool) error {
-	// get master status info
-	m.buffer.WriteString("SHOW MASTER STATUS:")
+func (m *globalMetadata) recordGlobalMetaData(db *sql.Conn, serverType ServerType, afterConn bool) error { // revive:disable-line:flag-parameter
 	if afterConn {
-		m.buffer.WriteString(" /* AFTER CONNECTION POOL ESTABLISHED */")
+		m.afterConnBuffer.Reset()
+		return recordGlobalMetaData(m.tctx, db, &m.afterConnBuffer, serverType, afterConn, m.snapshot)
 	}
-	m.buffer.WriteString("\n")
+	return recordGlobalMetaData(m.tctx, db, &m.buffer, serverType, afterConn, m.snapshot)
+}
+
+func recordGlobalMetaData(tctx *tcontext.Context, db *sql.Conn, buffer *bytes.Buffer, serverType ServerType, afterConn bool, snapshot string) error { // revive:disable-line:flag-parameter
+	writeMasterStatusHeader := func() {
+		buffer.WriteString("SHOW MASTER STATUS:")
+		if afterConn {
+			buffer.WriteString(" /* AFTER CONNECTION POOL ESTABLISHED */")
+		}
+		buffer.WriteString("\n")
+	}
+
 	switch serverType {
 	// For MySQL:
+	// mysql 5.6+
 	// mysql> SHOW MASTER STATUS;
 	// +-----------+----------+--------------+------------------+-------------------------------------------+
 	// | File      | Position | Binlog_Do_DB | Binlog_Ignore_DB | Executed_Gtid_Set                         |
@@ -63,6 +82,7 @@ func (m *globalMetadata) recordGlobalMetaData(db *sql.Conn, serverType ServerTyp
 	// | ON.000001 |     7502 |              |                  | 6ce40be3-e359-11e9-87e0-36933cb0ca5a:1-29 |
 	// +-----------+----------+--------------+------------------+-------------------------------------------+
 	// 1 row in set (0.00 sec)
+	// mysql 5.5- doesn't have column Executed_Gtid_Set
 	//
 	// For TiDB:
 	// mysql> SHOW MASTER STATUS;
@@ -73,18 +93,22 @@ func (m *globalMetadata) recordGlobalMetaData(db *sql.Conn, serverType ServerTyp
 	// +-------------+--------------------+--------------+------------------+-------------------+
 	// 1 row in set (0.00 sec)
 	case ServerTypeMySQL, ServerTypeTiDB:
-		str, err := ShowMasterStatus(db, showMasterStatusFieldNum)
+		str, err := ShowMasterStatus(db)
 		if err != nil {
 			return err
 		}
-		if logFile := str[fileFieldIndex]; logFile != "" {
-			m.buffer.WriteString("\tLog: " + logFile + "\n")
+		logFile := getValidStr(str, fileFieldIndex)
+		var pos string
+		if serverType == ServerTypeTiDB && snapshot != "" {
+			pos = snapshot
+		} else {
+			pos = getValidStr(str, posFieldIndex)
 		}
-		if pos := str[posFieldIndex]; pos != "" {
-			m.buffer.WriteString("\tPos: " + pos + "\n")
-		}
-		if gtidSet := str[gtidSetFieldIndex]; gtidSet != "" {
-			m.buffer.WriteString("\tGTID:" + gtidSet + "\n")
+		gtidSet := getValidStr(str, gtidSetFieldIndex)
+
+		if logFile != "" {
+			writeMasterStatusHeader()
+			fmt.Fprintf(buffer, "\tLog: %s\n\tPos: %s\n\tGTID:%s\n", logFile, pos, gtidSet)
 		}
 	// For MariaDB:
 	// SHOW MASTER STATUS;
@@ -101,28 +125,26 @@ func (m *globalMetadata) recordGlobalMetaData(db *sql.Conn, serverType ServerTyp
 	// +--------------------------+
 	// 1 row in set (0.00 sec)
 	case ServerTypeMariaDB:
-		str, err := ShowMasterStatus(db, mariadbShowMasterStatusFieldNum)
+		str, err := ShowMasterStatus(db)
 		if err != nil {
 			return err
 		}
-		if logFile := str[fileFieldIndex]; logFile != "" {
-			m.buffer.WriteString("\tLog: " + logFile + "\n")
-		}
-		if pos := str[posFieldIndex]; pos != "" {
-			m.buffer.WriteString("\tPos: " + pos + "\n")
-		}
+		logFile := getValidStr(str, fileFieldIndex)
+		pos := getValidStr(str, posFieldIndex)
 		var gtidSet string
 		err = db.QueryRowContext(context.Background(), "SELECT @@global.gtid_binlog_pos").Scan(&gtidSet)
 		if err != nil {
-			return err
+			tctx.L().Error("fail to get gtid for mariaDB", zap.Error(err))
 		}
-		if gtidSet != "" {
-			m.buffer.WriteString("\tGTID:" + gtidSet + "\n")
+
+		if logFile != "" {
+			writeMasterStatusHeader()
+			fmt.Fprintf(buffer, "\tLog: %s\n\tPos: %s\n\tGTID:%s\n", logFile, pos, gtidSet)
 		}
 	default:
-		return errors.New("unsupported serverType" + serverType.String() + "for recordGlobalMetaData")
+		return errors.Errorf("unsupported serverType %s for recordGlobalMetaData", serverType.String())
 	}
-	m.buffer.WriteString("\n")
+	buffer.WriteString("\n")
 	if serverType == ServerTypeTiDB {
 		return nil
 	}
@@ -150,49 +172,59 @@ func (m *globalMetadata) recordGlobalMetaData(db *sql.Conn, serverType ServerTyp
 	return simpleQuery(db, query, func(rows *sql.Rows) error {
 		cols, err := rows.Columns()
 		if err != nil {
-			return err
+			return errors.Trace(err)
 		}
-		data := make([]string, len(cols))
+		data := make([]sql.NullString, len(cols))
 		args := make([]interface{}, 0, len(cols))
 		for i := range data {
 			args = append(args, &data[i])
 		}
 		if err := rows.Scan(args...); err != nil {
-			return err
+			return errors.Trace(err)
 		}
 		var connName, pos, logFile, host, gtidSet string
 		for i, col := range cols {
-			col = strings.ToLower(col)
-			switch col {
-			case "connection_name":
-				connName = data[i]
-			case "exec_master_log_pos":
-				pos = data[i]
-			case "relay_master_log_file":
-				logFile = data[i]
-			case "master_host":
-				host = data[i]
-			case "executed_gtid_set":
-				gtidSet = data[i]
+			if data[i].Valid {
+				col = strings.ToLower(col)
+				switch col {
+				case "connection_name":
+					connName = data[i].String
+				case "exec_master_log_pos":
+					pos = data[i].String
+				case "relay_master_log_file":
+					logFile = data[i].String
+				case "master_host":
+					host = data[i].String
+				case "executed_gtid_set":
+					gtidSet = data[i].String
+				}
 			}
 		}
 		if len(host) > 0 {
-			m.buffer.WriteString("SHOW SLAVE STATUS:\n")
+			buffer.WriteString("SHOW SLAVE STATUS:\n")
 			if isms {
-				m.buffer.WriteString("\tConnection name: " + connName + "\n")
+				buffer.WriteString("\tConnection name: " + connName + "\n")
 			}
-			fmt.Fprintf(&m.buffer, "\tHost: %s\n\tLog: %s\n\tPos: %s\n\tGTID:%s\n\n", host, logFile, pos, gtidSet)
+			fmt.Fprintf(buffer, "\tHost: %s\n\tLog: %s\n\tPos: %s\n\tGTID:%s\n\n", host, logFile, pos, gtidSet)
 		}
 		return nil
 	})
 }
 
 func (m *globalMetadata) writeGlobalMetaData() error {
-	fileWriter, tearDown, err := buildFileWriter(m.filePath)
+	// keep consistent with mydumper. Never compress metadata
+	fileWriter, tearDown, err := buildFileWriter(m.tctx, m.storage, metadataPath, storage.NoCompression)
 	if err != nil {
 		return err
 	}
-	defer tearDown()
+	defer tearDown(m.tctx)
 
-	return write(fileWriter, m.String())
+	return write(m.tctx, fileWriter, m.String())
+}
+
+func getValidStr(str []string, idx int) string {
+	if idx < len(str) {
+		return str[idx]
+	}
+	return ""
 }

@@ -7,40 +7,43 @@ import (
 	"strings"
 	"time"
 
+	tcontext "github.com/eopenio/idump/v5/context"
+
+	"github.com/pingcap/errors"
 	"go.etcd.io/etcd/clientv3"
 )
 
 const tidbServerInformationPath = "/tidb/server/info"
 
-func GetPdDDLIDs(pCtx context.Context, cli *clientv3.Client) ([]string, error) {
+func getPdDDLIDs(pCtx context.Context, cli *clientv3.Client) ([]string, error) {
 	ctx, cancel := context.WithTimeout(pCtx, 10*time.Second)
 	defer cancel()
 
-	var pdDDLIds []string
 	resp, err := cli.Get(ctx, tidbServerInformationPath, clientv3.WithPrefix())
 	if err != nil {
-		return pdDDLIds, err
+		return nil, errors.Trace(err)
 	}
-	for _, kv := range resp.Kvs {
+	pdDDLIds := make([]string, len(resp.Kvs))
+	for i, kv := range resp.Kvs {
 		items := strings.Split(string(kv.Key), "/")
-		pdDDLIds = append(pdDDLIds, items[len(items)-1])
+		pdDDLIds[i] = items[len(items)-1]
 	}
 	return pdDDLIds, nil
 }
 
-func checkSameCluster(ctx context.Context, db *sql.DB, pdAddrs []string) (bool, error) {
+func checkSameCluster(tctx *tcontext.Context, db *sql.DB, pdAddrs []string) (bool, error) {
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   pdAddrs,
 		DialTimeout: defaultEtcdDialTimeOut,
 	})
 	if err != nil {
-		return false, err
+		return false, errors.Trace(err)
 	}
-	tidbDDLIDs, err := GetTiDBDDLIDs(db)
+	tidbDDLIDs, err := GetTiDBDDLIDs(tctx, db)
 	if err != nil {
 		return false, err
 	}
-	pdDDLIDs, err := GetPdDDLIDs(ctx, cli)
+	pdDDLIDs, err := getPdDDLIDs(tctx, cli)
 	if err != nil {
 		return false, err
 	}
@@ -60,4 +63,16 @@ func sameStringArray(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func string2Map(a, b []string) map[string]string {
+	a2b := make(map[string]string, len(a))
+	for i, str := range a {
+		a2b[str] = b[i]
+	}
+	return a2b
+}
+
+func needRepeatableRead(serverType ServerType, consistency string) bool {
+	return consistency != consistencyTypeSnapshot || serverType != ServerTypeTiDB
 }

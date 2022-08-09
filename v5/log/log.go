@@ -4,14 +4,11 @@ import (
 	"github.com/pingcap/errors"
 	pclog "github.com/pingcap/log"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
 
-var (
-	appLogger = Logger{zap.NewNop()}
-	appLevel  = zap.NewAtomicLevel()
-)
+var appLogger = Logger{zap.NewNop()}
 
+// Logger wraps the zap logger.
 type Logger struct {
 	*zap.Logger
 }
@@ -38,7 +35,8 @@ type Config struct {
 	Format string `toml:"format" json:"format"`
 }
 
-func InitAppLogger(cfg *Config) error {
+// InitAppLogger inits the wrapped logger from config.
+func InitAppLogger(cfg *Config) (Logger, *pclog.ZapProperties, error) {
 	logger, props, err := pclog.InitLogger(&pclog.Config{
 		Level: cfg.Level,
 		File: pclog.FileLogConfig{
@@ -50,42 +48,21 @@ func InitAppLogger(cfg *Config) error {
 		Format: cfg.Format,
 	})
 	if err != nil {
-		return errors.WithStack(err)
+		return appLogger, props, errors.Trace(err)
 	}
-	logger = logger.WithOptions(zap.AddCallerSkip(1))
-	appLogger = Logger{logger}
-	appLevel = props.Level
-	return nil
+	return Logger{logger.WithOptions(zap.AddStacktrace(zap.DPanicLevel))}, props, nil
 }
 
-func SetAppLogger(logger *zap.Logger) {
-	appLogger = Logger{logger}
+// NewAppLogger returns the wrapped logger from config.
+func NewAppLogger(logger *zap.Logger) Logger {
+	return Logger{logger}
 }
 
-func ChangeAppLogLevel(level zapcore.Level) {
-	appLevel.SetLevel(level)
-}
-
-func Info(msg string, fields ...zap.Field) {
-	appLogger.Info(msg, fields...)
-}
-
-func Warn(msg string, fields ...zap.Field) {
-	appLogger.Warn(msg, fields...)
-}
-
-func Error(msg string, fields ...zap.Field) {
-	appLogger.Error(msg, fields...)
-}
-
-func Debug(msg string, fields ...zap.Field) {
-	appLogger.Debug(msg, fields...)
-}
-
-func Fatal(msg string, fields ...zap.Field) {
-	appLogger.Fatal(msg, fields...)
-}
-
-func Panic(msg string, fields ...zap.Field) {
-	appLogger.Panic(msg, fields...)
+// ShortError contructs a field which only records the error message without the
+// verbose text (i.e. excludes the stack trace).
+func ShortError(err error) zap.Field {
+	if err == nil {
+		return zap.Skip()
+	}
+	return zap.String("error", err.Error())
 }

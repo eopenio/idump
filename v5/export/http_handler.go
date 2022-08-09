@@ -7,19 +7,20 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pingcap/dumpling/v4/log"
+	"github.com/eopenio/idump/v5/log"
+
+	tcontext "github.com/eopenio/idump/v5/context"
 
 	"github.com/pingcap/errors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/soheilhy/cmux"
-	"go.uber.org/zap"
 )
 
-var (
-	cmuxReadTimeout = 10 * time.Second
-)
+var cmuxReadTimeout = 10 * time.Second
 
-func startHTTPServer(lis net.Listener) {
+func startHTTPServer(tctx *tcontext.Context, lis net.Listener) {
 	router := http.NewServeMux()
+	router.Handle("/metrics", promhttp.Handler())
 
 	router.HandleFunc("/debug/pprof/", pprof.Index)
 	router.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
@@ -31,12 +32,13 @@ func startHTTPServer(lis net.Listener) {
 		Handler: router,
 	}
 	err := httpServer.Serve(lis)
+	err = errors.Cause(err)
 	if err != nil && !isErrNetClosing(err) && err != http.ErrServerClosed {
-		log.Error("http server return with error", zap.Error(err))
+		tctx.L().Warn("dumpling http handler return with error", log.ShortError(err))
 	}
 }
 
-func startDumplingService(addr string) error {
+func startDumplingService(tctx *tcontext.Context, addr string) error {
 	rootLis, err := net.Listen("tcp", addr)
 	if err != nil {
 		return errors.Annotate(err, "start listening")
@@ -47,7 +49,7 @@ func startDumplingService(addr string) error {
 	m.SetReadTimeout(cmuxReadTimeout) // set a timeout, ref: https://github.com/pingcap/tidb-binlog/pull/352
 
 	httpL := m.Match(cmux.HTTP1Fast())
-	go startHTTPServer(httpL)
+	go startHTTPServer(tctx, httpL)
 
 	err = m.Serve() // start serving, block
 	if err != nil && isErrNetClosing(err) {
@@ -56,9 +58,7 @@ func startDumplingService(addr string) error {
 	return err
 }
 
-var (
-	useOfClosedErrMsg = "use of closed network connection"
-)
+var useOfClosedErrMsg = "use of closed network connection"
 
 // isErrNetClosing checks whether is an ErrNetClosing error
 func isErrNetClosing(err error) bool {

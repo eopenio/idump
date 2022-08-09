@@ -6,14 +6,17 @@ import (
 	"database/sql/driver"
 	"fmt"
 
+	tcontext "github.com/eopenio/idump/v5/context"
+
 	"github.com/DATA-DOG/go-sqlmock"
 )
 
-type mockStringWriter struct {
+type mockPoisonWriter struct {
 	buf string
 }
 
-func (m *mockStringWriter) WriteString(s string) (int, error) {
+func (m *mockPoisonWriter) Write(_ context.Context, p []byte) (int, error) {
+	s := string(p)
 	if s == "poison" {
 		return 0, fmt.Errorf("poison_error")
 	}
@@ -21,32 +24,9 @@ func (m *mockStringWriter) WriteString(s string) (int, error) {
 	return len(s), nil
 }
 
-type mockStringCollector struct {
-	buf string
-}
-
-func (m *mockStringCollector) WriteString(s string) (int, error) {
-	m.buf += s
-	return len(s), nil
-}
-
-type mockSQLRowIterator struct {
-	idx  int
-	data [][]sql.NullString
-}
-
-func (m *mockSQLRowIterator) Next(sp RowReceiver) error {
-	args := make([]interface{}, len(m.data[m.idx]))
-	sp.BindAddress(args)
-	for i := range args {
-		*(args[i]).(*sql.NullString) = m.data[m.idx][i]
-	}
-	m.idx += 1
+func (m *mockPoisonWriter) Close(_ context.Context) error {
+	// noop
 	return nil
-}
-
-func (m *mockSQLRowIterator) HasNext() bool {
-	return m.idx < len(m.data)
 }
 
 type mockMetaIR struct {
@@ -76,19 +56,43 @@ func newMockMetaIR(targetName string, meta string, specialComments []string) Met
 }
 
 type mockTableIR struct {
-	dbName          string
-	tblName         string
-	chunIndex       int
-	data            [][]driver.Value
-	selectedField   string
-	specCmt         []string
-	colTypes        []string
-	colNames        []string
-	escapeBackSlash bool
-	rowErr          error
+	dbName           string
+	tblName          string
+	chunIndex        int
+	data             [][]driver.Value
+	selectedField    string
+	selectedLen      int
+	specCmt          []string
+	colTypes         []string
+	colNames         []string
+	escapeBackSlash  bool
+	hasImplicitRowID bool
+	rowErr           error
+	rows             *sql.Rows
+	SQLRowIter
 }
 
-func (m *mockTableIR) Start(ctx context.Context, conn *sql.Conn) error {
+func (m *mockTableIR) RawRows() *sql.Rows {
+	return m.rows
+}
+
+func (m *mockTableIR) ShowCreateTable() string {
+	return ""
+}
+
+func (m *mockTableIR) ShowCreateView() string {
+	return ""
+}
+
+func (m *mockTableIR) AvgRowLength() uint64 {
+	return 0
+}
+
+func (m *mockTableIR) HasImplicitRowID() bool {
+	return m.hasImplicitRowID
+}
+
+func (m *mockTableIR) Start(_ *tcontext.Context, conn *sql.Conn) error {
 	return nil
 }
 
@@ -117,10 +121,11 @@ func (m *mockTableIR) ColumnNames() []string {
 }
 
 func (m *mockTableIR) SelectedField() string {
-	if m.selectedField == "*" {
-		return ""
-	}
 	return m.selectedField
+}
+
+func (m *mockTableIR) SelectedLen() int {
+	return m.selectedLen
 }
 
 func (m *mockTableIR) SpecialComments() StringIter {
@@ -128,25 +133,32 @@ func (m *mockTableIR) SpecialComments() StringIter {
 }
 
 func (m *mockTableIR) Rows() SQLRowIter {
-	mockRows := sqlmock.NewRows(m.colTypes)
-	for _, datum := range m.data {
-		mockRows.AddRow(datum...)
+	if m.SQLRowIter == nil {
+		mockRows := sqlmock.NewRows(m.colTypes)
+		for _, datum := range m.data {
+			mockRows.AddRow(datum...)
+		}
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			panic(fmt.Sprintf("sqlmock.New return error: %v", err))
+		}
+		defer db.Close()
+		mock.ExpectQuery("select 1").WillReturnRows(mockRows)
+		if m.rowErr != nil {
+			mockRows.RowError(len(m.data)-1, m.rowErr)
+		}
+		rows, err := db.Query("select 1")
+		if err != nil {
+			panic(fmt.Sprintf("sqlmock.New return error: %v", err))
+		}
+		m.SQLRowIter = newRowIter(rows, len(m.colTypes))
+		m.rows = rows
 	}
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		panic(fmt.Sprintf("sqlmock.New return error: %v", err))
-	}
-	defer db.Close()
-	mock.ExpectQuery("select 1").WillReturnRows(mockRows)
-	if m.rowErr != nil {
-		mockRows.RowError(len(m.data)-1, m.rowErr)
-	}
-	rows, err := db.Query("select 1")
-	if err != nil {
-		panic(fmt.Sprintf("sqlmock.New return error: %v", err))
-	}
+	return m.SQLRowIter
+}
 
-	return newRowIter(rows, len(m.colTypes))
+func (m *mockTableIR) Close() error {
+	return nil
 }
 
 func (m *mockTableIR) EscapeBackSlash() bool {
@@ -160,6 +172,8 @@ func newMockTableIR(databaseName, tableName string, data [][]driver.Value, speci
 		data:          data,
 		specCmt:       specialComments,
 		selectedField: "*",
+		selectedLen:   len(colTypes),
 		colTypes:      colTypes,
+		SQLRowIter:    nil,
 	}
 }
