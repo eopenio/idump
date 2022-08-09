@@ -1,7 +1,0 @@
-.DS_Store
-bin/
-coverage.txt
-.idea
-var
-fix.sql
-main.go
